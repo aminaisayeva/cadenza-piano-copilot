@@ -7,10 +7,16 @@ import "./App.css";
 import { CadenzaSocket, type SuggestedNote, type SuggestMode } from "./ws";
 import { enableMidi, isSupported, listen } from "./midi";
 import { Score } from "./score";
-import { initAudio, playSuggestion, playNote } from "./playback";
+import { initAudio, playSuggestion, playNote, playMelody, stopMelody } from "./playback";
 
 // A short C-major phrase so the app is demoable without a physical keyboard.
 const DEMO_MELODY = [60, 62, 64, 67, 65, 64, 62, 64];
+
+// How many note-groups to keep on the staff (wraps across rows in the Score).
+const MAX_LIVE = 32;
+
+// Note-ons landing within this window are treated as one chord (struck together).
+const CHORD_WINDOW_MS = 60;
 
 interface Suggestion {
   id: string;
@@ -32,7 +38,7 @@ export default function App() {
   const [connected, setConnected] = useState(false);
   const [midiDevices, setMidiDevices] = useState<string[]>([]);
   const [midiError, setMidiError] = useState<string | null>(null);
-  const [liveNotes, setLiveNotes] = useState<number[]>([]);
+  const [liveGroups, setLiveGroups] = useState<number[][]>([]);
   const [analysis, setAnalysis] = useState<{ key?: string; chord?: string; roman?: string } | null>(null);
   const [suggestion, setSuggestion] = useState<Suggestion | null>(null);
   const [stats, setStats] = useState({ shown: 0, accepted: 0 });
@@ -42,6 +48,25 @@ export default function App() {
   // keep latest suggestion in a ref so the key handler isn't stale
   const suggestionRef = useRef<Suggestion | null>(null);
   suggestionRef.current = suggestion;
+
+  // Buffer note-ons that arrive close together, then flush them as one chord.
+  const chordBuf = useRef<number[]>([]);
+  const chordTimer = useRef<number | null>(null);
+  const flushChord = useCallback(() => {
+    const group = [...chordBuf.current].sort((a, b) => a - b);
+    chordBuf.current = [];
+    chordTimer.current = null;
+    if (group.length) setLiveGroups((prev) => [...prev, group].slice(-MAX_LIVE));
+  }, []);
+  const ingestNote = useCallback(
+    (note: number) => {
+      chordBuf.current.push(note);
+      if (chordTimer.current == null) {
+        chordTimer.current = window.setTimeout(flushChord, CHORD_WINDOW_MS);
+      }
+    },
+    [flushChord],
+  );
 
   useEffect(() => {
     const sock = new CadenzaSocket();
@@ -70,7 +95,7 @@ export default function App() {
       setMidiError(null);
       listen({
         onNoteOn: (e) => {
-          setLiveNotes((prev) => [...prev.slice(-15), e.note]);
+          ingestNote(e.note); // grouped into a chord if struck with others
           socketRef.current?.send({ type: "note_on", note: e.note, velocity: e.velocity, time: e.time });
         },
         onNoteOff: (e) => socketRef.current?.send({ type: "note_off", note: e.note, time: e.time }),
@@ -89,11 +114,11 @@ export default function App() {
   // demo the copilot (and record a video) without a keyboard.
   async function playDemoMelody() {
     await initAudio();
-    setLiveNotes([]);
+    setLiveGroups([]);
     setSuggestion(null);
     DEMO_MELODY.forEach((note, i) => {
       setTimeout(() => {
-        setLiveNotes((prev) => [...prev.slice(-15), note]);
+        setLiveGroups((prev) => [...prev, [note]].slice(-MAX_LIVE));
         socketRef.current?.send({ type: "note_on", note, velocity: 90, time: i });
         void playNote(note);
       }, i * 450);
@@ -104,11 +129,14 @@ export default function App() {
     const s = suggestionRef.current;
     if (!s) return;
     void playSuggestion(s.notes);
-    // commit melodic suggestions onto the staff (chords are played, not appended)
+    // commit the accepted suggestion onto the staff: a melodic line becomes one
+    // group per note; a simultaneous suggestion (harmonize) becomes one chord.
     const distinctStarts = new Set(s.notes.map((n) => n.start));
-    if (distinctStarts.size > 1) {
-      setLiveNotes((prev) => [...prev, ...s.notes.map((n) => n.note)].slice(-20));
-    }
+    const groups: number[][] =
+      distinctStarts.size > 1
+        ? s.notes.map((n) => [n.note])
+        : [s.notes.map((n) => n.note)];
+    setLiveGroups((prev) => [...prev, ...groups].slice(-MAX_LIVE));
     socketRef.current?.send({ type: "decision", suggestion_id: s.id, accepted: true });
     setStats((st) => ({ ...st, accepted: st.accepted + 1 }));
     setSuggestion(null);
@@ -162,7 +190,25 @@ export default function App() {
           Your notes in black; AI suggestions appear as grey <em>ghost notes</em> —
           press <kbd>Tab</kbd> to accept, <kbd>Esc</kbd> to dismiss.
         </p>
-        <Score notes={liveNotes} ghost={suggestion?.notes ?? []} />
+        <Score notes={liveGroups} ghost={suggestion?.notes ?? []} />
+        <div className="modes">
+          <button onClick={() => playMelody(liveGroups)} disabled={liveGroups.length === 0}>
+            ▶ Run
+          </button>
+          <button className="ghost-btn" onClick={() => stopMelody()}>■ Stop</button>
+          <button
+            className="ghost-btn"
+            onClick={() => {
+              stopMelody();
+              chordBuf.current = [];
+              setLiveGroups([]);
+              setSuggestion(null);
+            }}
+            disabled={liveGroups.length === 0}
+          >
+            Clear
+          </button>
+        </div>
         <div className="modes">
           <label className="model-select">
             model:
