@@ -51,16 +51,22 @@ export function stopMelody(): void {
   piano?.stop();
 }
 
-/** Play a sequence of note groups (chords sound together); stopMelody() halts. */
-export async function playMelody(groups: number[][], stepMs = 420): Promise<void> {
+/**
+ * Replay a performance at its captured tempo: each note sounds at its real onset
+ * and is held for its real duration (both in beats). stopMelody() halts it.
+ */
+export async function playPerformance(
+  notes: { note: number; onset: number; dur: number }[],
+  bpm = 120,
+): Promise<void> {
   await initAudio();
   stopMelody();
-  groups.forEach((group, i) => {
+  const beatMs = 60000 / bpm;
+  const t0 = Math.min(...notes.map((n) => n.onset), 0);
+  for (const n of notes) {
     const id = window.setTimeout(() => {
-      for (const midi of group) {
-        piano?.start({ note: midi, duration: (stepMs / 1000) * 0.9, velocity: 90 });
-      }
-    }, i * stepMs);
+      piano?.start({ note: n.note, duration: Math.max(0.1, (n.dur * beatMs) / 1000), velocity: 90 });
+    }, (n.onset - t0) * beatMs);
     melodyTimers.push(id);
-  });
+  }
 }
