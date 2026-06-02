@@ -33,4 +33,5 @@ jobs:
         with:
           node-version: "20"
       - run: npm ci
+      - run: npm test        # vitest (notation logic)
       - run: npm run build   # tsc typecheck + vite bundle
