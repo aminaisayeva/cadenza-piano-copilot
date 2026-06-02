@@ -1,0 +1,12 @@
+# Full local install (core + ML). The neural model is lazy-loaded at runtime, so
+# the default test suite does NOT need these — see requirements-core.txt.
+-r requirements-core.txt
+
+torch>=2.2
+transformers>=4.45
+# AMT (Anticipatory Music Transformer) — install from git, no PyPI release:
+#   pip install --no-deps git+https://github.com/jthickstun/anticipation.git
+# (--no-deps protects the modern transformers above from its 4.29 pin)
+#
+# Aria (optional, needs Python >=3.11):
+#   pip install git+https://github.com/EleutherAI/aria-utils.git

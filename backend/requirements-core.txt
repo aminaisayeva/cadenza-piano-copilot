@@ -1,0 +1,11 @@
+# Core deps — enough to run the app's rule-based path, the understanding/tutor
+# layers, the eval harness, and the full default test suite (no ML wheels).
+fastapi==0.115.*
+uvicorn[standard]==0.34.*
+music21==9.*
+pydantic==2.*
+miditok==3.*
+mido==1.3.*
+anthropic==0.*
+python-dotenv==1.*
+pytest==8.*

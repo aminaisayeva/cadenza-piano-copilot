@@ -1,0 +1,25 @@
+# Python
+backend/.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+backend/.env
+.env
+
+# Node
+frontend/node_modules/
+frontend/dist/
+
+# Models / caches
+.cache/
+*.ckpt
+*.safetensors
+hf_cache/
+
+# Telemetry / generated reports (keep checked-in samples out)
+backend/telemetry/*.jsonl
+backend/eval/REPORT.md
+backend/eval/charts/
+
+# OS
+.DS_Store
