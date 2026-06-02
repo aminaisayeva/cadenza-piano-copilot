@@ -39,3 +39,28 @@ export async function playNote(midi: number): Promise<void> {
   await initAudio();
   piano!.start({ note: midi, duration: 0.5, velocity: 90 });
 }
+
+// --- melody transport (Run / Stop) ----------------------------------------
+
+let melodyTimers: number[] = [];
+
+/** Stop any in-progress melody playback. */
+export function stopMelody(): void {
+  melodyTimers.forEach((id) => clearTimeout(id));
+  melodyTimers = [];
+  piano?.stop();
+}
+
+/** Play a sequence of note groups (chords sound together); stopMelody() halts. */
+export async function playMelody(groups: number[][], stepMs = 420): Promise<void> {
+  await initAudio();
+  stopMelody();
+  groups.forEach((group, i) => {
+    const id = window.setTimeout(() => {
+      for (const midi of group) {
+        piano?.start({ note: midi, duration: (stepMs / 1000) * 0.9, velocity: 90 });
+      }
+    }, i * stepMs);
+    melodyTimers.push(id);
+  });
+}
