@@ -31,6 +31,9 @@ git clone https://github.com/aminaisayeva/cadenza-piano-copilot.git
 cd cadenza-piano-copilot
 ```
 
+**Fastest path:** `./start.sh` sets up anything missing, starts both servers, and
+opens the app in your browser (Ctrl+C to stop). Or follow the manual steps below.
+
 ### 1. Backend
 
 ```bash
