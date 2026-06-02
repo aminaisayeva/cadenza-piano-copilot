@@ -1,22 +1,24 @@
-// Phase 2: the copilot loop. Play -> request a suggestion -> grey ghost notes
-// appear -> Tab accepts (commit + play + log), Esc dismisses (log). A live HUD
-// shows the Copilot-style acceptance rate.
+// The copilot loop: play -> request a suggestion -> grey ghost notes appear ->
+// Tab accepts (commit + play + log), Esc dismisses. A live HUD shows the
+// Copilot-style acceptance rate. Played notes carry real durations so the score
+// engraves proper note values, bars, and rests (see ./notation).
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import "./App.css";
 import { CadenzaSocket, type SuggestedNote, type SuggestMode } from "./ws";
 import { enableMidi, isSupported, listen } from "./midi";
 import { Score } from "./score";
-import { initAudio, playSuggestion, playNote, playMelody, stopMelody } from "./playback";
+import type { PlayedNote } from "./notation";
+import { initAudio, playSuggestion, playNote, playPerformance, stopMelody } from "./playback";
 
-// A short C-major phrase so the app is demoable without a physical keyboard.
+// A short C-major phrase (quarter notes) so the app is demoable without hardware.
 const DEMO_MELODY = [60, 62, 64, 67, 65, 64, 62, 64];
 
-// How many note-groups to keep on the staff (wraps across rows in the Score).
-const MAX_LIVE = 32;
+const MAX_EVENTS = 64; // bound how much of the performance we keep on the staff
+const BEAT_MS = 500; // 120 bpm: maps held time -> note value
+const GRID = 0.25;
 
-// Note-ons landing within this window are treated as one chord (struck together).
-const CHORD_WINDOW_MS = 60;
+type LiveNote = PlayedNote & { id: number };
 
 interface Suggestion {
   id: string;
@@ -38,35 +40,48 @@ export default function App() {
   const [connected, setConnected] = useState(false);
   const [midiDevices, setMidiDevices] = useState<string[]>([]);
   const [midiError, setMidiError] = useState<string | null>(null);
-  const [liveGroups, setLiveGroups] = useState<number[][]>([]);
+  const [events, setEvents] = useState<LiveNote[]>([]);
   const [analysis, setAnalysis] = useState<{ key?: string; chord?: string; roman?: string } | null>(null);
   const [suggestion, setSuggestion] = useState<Suggestion | null>(null);
   const [stats, setStats] = useState({ shown: 0, accepted: 0 });
   const [model, setModel] = useState<"rule-based" | "amt">("rule-based");
   const [pending, setPending] = useState(false);
 
-  // keep latest suggestion in a ref so the key handler isn't stale
   const suggestionRef = useRef<Suggestion | null>(null);
   suggestionRef.current = suggestion;
 
-  // Buffer note-ons that arrive close together, then flush them as one chord.
-  const chordBuf = useRef<number[]>([]);
-  const chordTimer = useRef<number | null>(null);
-  const flushChord = useCallback(() => {
-    const group = [...chordBuf.current].sort((a, b) => a - b);
-    chordBuf.current = [];
-    chordTimer.current = null;
-    if (group.length) setLiveGroups((prev) => [...prev, group].slice(-MAX_LIVE));
+  // Timing state for turning live note on/off into onsets + durations (in beats).
+  const startMs = useRef<number | null>(null);
+  const active = useRef<Map<number, number>>(new Map()); // midi -> event id
+  const nextId = useRef(0);
+
+  const resetPerformance = useCallback(() => {
+    startMs.current = null;
+    active.current.clear();
+    setEvents([]);
+    setSuggestion(null);
   }, []);
-  const ingestNote = useCallback(
-    (note: number) => {
-      chordBuf.current.push(note);
-      if (chordTimer.current == null) {
-        chordTimer.current = window.setTimeout(flushChord, CHORD_WINDOW_MS);
-      }
-    },
-    [flushChord],
-  );
+
+  const onNoteOn = useCallback((note: number, timeSec: number) => {
+    const tMs = timeSec * 1000;
+    if (startMs.current === null) startMs.current = tMs;
+    const onset = (tMs - startMs.current) / BEAT_MS;
+    const id = nextId.current++;
+    active.current.set(note, id);
+    // provisional quarter until the key is released
+    setEvents((prev) => [...prev, { id, note, onset, dur: 1 }].slice(-MAX_EVENTS));
+  }, []);
+
+  const onNoteOff = useCallback((note: number, timeSec: number) => {
+    const id = active.current.get(note);
+    if (id === undefined) return;
+    active.current.delete(note);
+    const start = startMs.current ?? timeSec * 1000;
+    const end = (timeSec * 1000 - start) / BEAT_MS;
+    setEvents((prev) =>
+      prev.map((ev) => (ev.id === id ? { ...ev, dur: Math.max(GRID, end - ev.onset) } : ev)),
+    );
+  }, []);
 
   useEffect(() => {
     const sock = new CadenzaSocket();
@@ -95,10 +110,13 @@ export default function App() {
       setMidiError(null);
       listen({
         onNoteOn: (e) => {
-          ingestNote(e.note); // grouped into a chord if struck with others
+          onNoteOn(e.note, e.time);
           socketRef.current?.send({ type: "note_on", note: e.note, velocity: e.velocity, time: e.time });
         },
-        onNoteOff: (e) => socketRef.current?.send({ type: "note_off", note: e.note, time: e.time }),
+        onNoteOff: (e) => {
+          onNoteOff(e.note, e.time);
+          socketRef.current?.send({ type: "note_off", note: e.note, time: e.time });
+        },
       });
     } catch (err) {
       setMidiError(err instanceof Error ? err.message : String(err));
@@ -110,15 +128,15 @@ export default function App() {
     socketRef.current?.send({ type: "request_suggestion", mode, model });
   }
 
-  // Play a canned phrase — feeds the same path as real MIDI input so you can
-  // demo the copilot (and record a video) without a keyboard.
+  // Canned phrase — feeds the same path as real input so you can demo (or record)
+  // without a keyboard. Each note is a quarter, so it engraves as two 4/4 bars.
   async function playDemoMelody() {
     await initAudio();
-    setLiveGroups([]);
-    setSuggestion(null);
+    resetPerformance();
     DEMO_MELODY.forEach((note, i) => {
       setTimeout(() => {
-        setLiveGroups((prev) => [...prev, [note]].slice(-MAX_LIVE));
+        const id = nextId.current++;
+        setEvents((prev) => [...prev, { id, note, onset: i, dur: 1 }].slice(-MAX_EVENTS));
         socketRef.current?.send({ type: "note_on", note, velocity: 90, time: i });
         void playNote(note);
       }, i * 450);
@@ -129,14 +147,16 @@ export default function App() {
     const s = suggestionRef.current;
     if (!s) return;
     void playSuggestion(s.notes);
-    // commit the accepted suggestion onto the staff: a melodic line becomes one
-    // group per note; a simultaneous suggestion (harmonize) becomes one chord.
-    const distinctStarts = new Set(s.notes.map((n) => n.start));
-    const groups: number[][] =
-      distinctStarts.size > 1
-        ? s.notes.map((n) => [n.note])
-        : [s.notes.map((n) => n.note)];
-    setLiveGroups((prev) => [...prev, ...groups].slice(-MAX_LIVE));
+    setEvents((prev) => {
+      const base = prev.length ? Math.max(...prev.map((e) => e.onset + e.dur)) : 0;
+      const add = s.notes.map((n) => ({
+        id: nextId.current++,
+        note: n.note,
+        onset: base + n.start,
+        dur: n.duration,
+      }));
+      return [...prev, ...add].slice(-MAX_EVENTS);
+    });
     socketRef.current?.send({ type: "decision", suggestion_id: s.id, accepted: true });
     setStats((st) => ({ ...st, accepted: st.accepted + 1 }));
     setSuggestion(null);
@@ -149,7 +169,6 @@ export default function App() {
     setSuggestion(null);
   }, []);
 
-  // Tab accepts, Esc dismisses (only while a suggestion is showing).
   useEffect(() => {
     function onKey(e: KeyboardEvent) {
       if (!suggestionRef.current) return;
@@ -166,6 +185,13 @@ export default function App() {
   }, [accept, dismiss]);
 
   const rate = stats.shown ? Math.round((stats.accepted / stats.shown) * 100) : 0;
+
+  // Position the pending suggestion right after the played notes, as grey ghosts.
+  const base = events.length ? Math.max(...events.map((e) => e.onset + e.dur)) : 0;
+  const ghostEvents: PlayedNote[] = suggestion
+    ? suggestion.notes.map((n) => ({ note: n.note, onset: base + n.start, dur: n.duration, ghost: true }))
+    : [];
+  const allEvents: PlayedNote[] = [...events, ...ghostEvents];
 
   return (
     <div className="app">
@@ -187,12 +213,12 @@ export default function App() {
       <section className="card">
         <h2>Score</h2>
         <p className="hint">
-          Your notes in black; AI suggestions appear as grey <em>ghost notes</em> —
-          press <kbd>Tab</kbd> to accept, <kbd>Esc</kbd> to dismiss.
+          Right hand on the treble staff, left hand on the bass; AI suggestions
+          appear as grey <em>ghost notes</em> — <kbd>Tab</kbd> to accept, <kbd>Esc</kbd> to dismiss.
         </p>
-        <Score notes={liveGroups} ghost={suggestion?.notes ?? []} />
+        <Score events={allEvents} />
         <div className="modes">
-          <button onClick={() => playMelody(liveGroups)} disabled={liveGroups.length === 0}>
+          <button onClick={() => playPerformance(events)} disabled={events.length === 0}>
             ▶ Run
           </button>
           <button className="ghost-btn" onClick={() => stopMelody()}>■ Stop</button>
@@ -200,11 +226,9 @@ export default function App() {
             className="ghost-btn"
             onClick={() => {
               stopMelody();
-              chordBuf.current = [];
-              setLiveGroups([]);
-              setSuggestion(null);
+              resetPerformance();
             }}
-            disabled={liveGroups.length === 0}
+            disabled={events.length === 0}
           >
             Clear
           </button>

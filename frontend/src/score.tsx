@@ -1,7 +1,6 @@
-// VexFlow grand-staff notation. Each "beat" (a group of simultaneously struck
-// notes) is split by pitch into the treble (right hand) and bass (left hand)
-// clefs; chords stack on whichever hand played them. AI suggestions render as
-// grey "ghost notes" appended after the player's input.
+// VexFlow grand-staff notation. Played notes (with real durations) are laid out
+// by ./notation into 4/4 measures per hand — proper note values, bar lines, and
+// rests only where a hand is silent. AI suggestions render as grey ghost notes.
 
 import { useEffect, useRef } from "react";
 import {
@@ -12,20 +11,12 @@ import {
   Voice,
   Formatter,
   Accidental,
+  Dot,
 } from "vexflow";
-import type { SuggestedNote } from "./ws";
+import { layout, type Clef, type NElement, type PlayedNote } from "./notation";
 
 const SHARP_NAMES = ["c", "c#", "d", "d#", "e", "f", "f#", "g", "g#", "a", "a#", "b"];
 const GHOST_COLOR = "#9aa0a6";
-const MIDDLE_C = 60; // split point: >= treble (right hand), < bass (left hand)
-
-type Clef = "treble" | "bass";
-
-interface Beat {
-  treble: number[];
-  bass: number[];
-  ghost: boolean;
-}
 
 /** MIDI number -> VexFlow key like "c#/4", plus whether it needs an accidental. */
 export function midiToVexKey(midi: number): { key: string; accidental: string | null } {
@@ -34,57 +25,39 @@ export function midiToVexKey(midi: number): { key: string; accidental: string | 
   return { key: `${name}/${octave}`, accidental: name.includes("#") ? "#" : null };
 }
 
-function noteFor(midis: number[], clef: Clef, color?: string): StaveNote {
-  const sorted = [...midis].sort((a, b) => a - b);
-  const n = new StaveNote({ keys: sorted.map((m) => midiToVexKey(m).key), duration: "q", clef });
+function buildElement(el: NElement, clef: Clef): StaveNote {
+  if (el.kind === "rest") {
+    const sn = new StaveNote({
+      keys: [clef === "treble" ? "b/4" : "d/3"],
+      duration: `${el.code}r`,
+      clef,
+    });
+    for (let i = 0; i < el.dots; i++) Dot.buildAndAttach([sn], { all: true });
+    return sn;
+  }
+  const sorted = [...el.notes].sort((a, b) => a - b);
+  const sn = new StaveNote({ keys: sorted.map((m) => midiToVexKey(m).key), duration: el.code, clef });
   sorted.forEach((m, i) => {
-    if (midiToVexKey(m).accidental) n.addModifier(new Accidental("#"), i);
+    if (midiToVexKey(m).accidental) sn.addModifier(new Accidental("#"), i);
   });
-  if (color) n.setStyle({ fillStyle: color, strokeStyle: color });
-  return n;
-}
-
-function restFor(clef: Clef): StaveNote {
-  return new StaveNote({ keys: [clef === "treble" ? "b/4" : "d/3"], duration: "qr", clef });
-}
-
-/** One tickable per beat per clef (a note/chord, or a rest to keep voices aligned). */
-function tickable(beat: Beat, clef: Clef): StaveNote {
-  const notes = clef === "treble" ? beat.treble : beat.bass;
-  return notes.length ? noteFor(notes, clef, beat.ghost ? GHOST_COLOR : undefined) : restFor(clef);
-}
-
-function splitBeat(notes: number[], ghost: boolean): Beat {
-  return {
-    treble: notes.filter((m) => m >= MIDDLE_C),
-    bass: notes.filter((m) => m < MIDDLE_C),
-    ghost,
-  };
-}
-
-/** Group a suggestion's notes by onset into ghost beats (chord if simultaneous). */
-function ghostBeats(ghost: SuggestedNote[]): Beat[] {
-  const byStart = new Map<number, number[]>();
-  for (const s of ghost) byStart.set(s.start, [...(byStart.get(s.start) ?? []), s.note]);
-  return [...byStart.entries()]
-    .sort((a, b) => a[0] - b[0])
-    .map(([, notes]) => splitBeat(notes, true));
+  for (let i = 0; i < el.dots; i++) Dot.buildAndAttach([sn], { all: true });
+  if (el.ghost) sn.setStyle({ fillStyle: GHOST_COLOR, strokeStyle: GHOST_COLOR });
+  return sn;
 }
 
 export interface ScoreProps {
-  // committed input as groups: each group is one beat — a single note, or a
-  // chord when several keys were struck at the same time, across both hands.
-  notes: number[][];
-  ghost?: SuggestedNote[];
+  events: PlayedNote[];
   width?: number;
-  notesPerRow?: number;
+  measuresPerRow?: number;
 }
 
-const ROW_HEIGHT = 180;
-const STAFF_GAP = 80; // treble -> bass vertical offset within a row
+const ROW_HEIGHT = 210; // room for ledger lines between systems
+const STAFF_GAP = 95; // treble -> bass offset within a system
 const TOP_PAD = 10;
+const BOTTOM_PAD = 80; // space for low bass ledger lines on the last system
+const MIN_BARS = 3; // always show at least three systems from the start
 
-export function Score({ notes, ghost = [], width = 720, notesPerRow = 8 }: ScoreProps) {
+export function Score({ events, width = 720, measuresPerRow = 1 }: ScoreProps) {
   const containerRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -92,47 +65,51 @@ export function Score({ notes, ghost = [], width = 720, notesPerRow = 8 }: Score
     if (!el) return;
     el.innerHTML = "";
 
-    const beats: Beat[] = [
-      ...notes.map((g) => splitBeat(g, false)),
-      ...ghostBeats(ghost),
-    ];
-
-    const rows: Beat[][] = [];
-    for (let i = 0; i < beats.length; i += notesPerRow) rows.push(beats.slice(i, i + notesPerRow));
-    if (rows.length === 0) rows.push([]); // always show an empty grand staff
+    const { treble, bass } = layout(events);
+    const barCount = Math.max(treble.length, bass.length, MIN_BARS);
+    const measureW = (width - 20) / measuresPerRow;
+    const rows = Math.ceil(barCount / measuresPerRow);
 
     const renderer = new Renderer(el, Renderer.Backends.SVG);
-    renderer.resize(width, rows.length * ROW_HEIGHT + TOP_PAD);
+    renderer.resize(width, rows * ROW_HEIGHT + TOP_PAD + BOTTOM_PAD);
     const ctx = renderer.getContext();
 
-    rows.forEach((row, idx) => {
-      const trebleY = TOP_PAD + idx * ROW_HEIGHT;
+    for (let bar = 0; bar < barCount; bar++) {
+      const row = Math.floor(bar / measuresPerRow);
+      const col = bar % measuresPerRow;
+      const x = 10 + col * measureW;
+      const trebleY = TOP_PAD + row * ROW_HEIGHT;
       const bassY = trebleY + STAFF_GAP;
 
-      const treble = new Stave(10, trebleY, width - 20);
-      const bass = new Stave(10, bassY, width - 20);
-      treble.addClef("treble");
-      bass.addClef("bass");
-      if (idx === 0) {
-        treble.addTimeSignature("4/4");
-        bass.addTimeSignature("4/4");
+      const tStave = new Stave(x, trebleY, measureW);
+      const bStave = new Stave(x, bassY, measureW);
+      if (col === 0) {
+        tStave.addClef("treble");
+        bStave.addClef("bass");
+        if (bar === 0) {
+          tStave.addTimeSignature("4/4");
+          bStave.addTimeSignature("4/4");
+        }
       }
-      treble.setContext(ctx).draw();
-      bass.setContext(ctx).draw();
-      // brace + left barline join the two staves into a grand staff
-      new StaveConnector(treble, bass).setType(StaveConnector.type.BRACE).setContext(ctx).draw();
-      new StaveConnector(treble, bass).setType(StaveConnector.type.SINGLE_LEFT).setContext(ctx).draw();
+      tStave.setContext(ctx).draw();
+      bStave.setContext(ctx).draw();
+      if (col === 0) {
+        new StaveConnector(tStave, bStave).setType(StaveConnector.type.BRACE).setContext(ctx).draw();
+        new StaveConnector(tStave, bStave).setType(StaveConnector.type.SINGLE_LEFT).setContext(ctx).draw();
+      }
 
-      if (row.length === 0) return;
-      const tv = new Voice({ numBeats: row.length, beatValue: 4 }).setStrict(false);
-      const bv = new Voice({ numBeats: row.length, beatValue: 4 }).setStrict(false);
-      tv.addTickables(row.map((b) => tickable(b, "treble")));
-      bv.addTickables(row.map((b) => tickable(b, "bass")));
-      new Formatter().joinVoices([tv, bv]).format([tv, bv], width - 90);
-      tv.draw(ctx, treble);
-      bv.draw(ctx, bass);
-    });
-  }, [notes, ghost, width, notesPerRow]);
+      const wholeRest: NElement = { kind: "rest", code: "w", dots: 0, beats: 4, notes: [], ghost: false };
+      const drawClef = (stave: Stave, measure: NElement[] | undefined, clef: Clef) => {
+        const els = measure && measure.length ? measure : [wholeRest]; // empty bar -> whole rest
+        const voice = new Voice({ numBeats: 4, beatValue: 4 }).setStrict(false);
+        voice.addTickables(els.map((m) => buildElement(m, clef)));
+        new Formatter().joinVoices([voice]).format([voice], measureW - (col === 0 ? 60 : 20));
+        voice.draw(ctx, stave);
+      };
+      drawClef(tStave, treble[bar], "treble");
+      drawClef(bStave, bass[bar], "bass");
+    }
+  }, [events, width, measuresPerRow]);
 
   return <div ref={containerRef} />;
 }
